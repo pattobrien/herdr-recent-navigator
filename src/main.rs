@@ -31,7 +31,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use cli::{Cli, Command as CliCommand};
-use models::{AppState, CategoryTab, FocusTarget, KeyAction, Keybindings, parse_tabs};
+use models::{AgentSort, AppState, CategoryTab, FocusTarget, KeyAction, Keybindings, parse_tabs};
 
 type RunInnerResult = Result<(
     AppState,
@@ -99,6 +99,12 @@ fn main() -> Result<()> {
                 state.save_category(&cat);
             }
         }
+        AppState::save_agent_sort(
+            cli.sort
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+        );
         return handle_pane_open();
     }
 
@@ -270,6 +276,12 @@ fn run_inner(cli: &Cli) -> RunInnerResult {
     if !state.tabs.contains(&state.current_category) {
         state.current_category = state.tabs[0];
     }
+    state.agent_sort = cli
+        .sort
+        .as_deref()
+        .and_then(|s| s.parse::<AgentSort>().ok())
+        .or_else(AppState::load_agent_sort)
+        .unwrap_or_default();
 
     Ok((state, pane_ts, tab_ts, ws_ts, ctx, connected))
 }
@@ -685,6 +697,7 @@ fn run_event_loop(
             active_tab_id: ctx.tab_id.as_deref(),
             self_pane_id: ctx.self_pane_id.as_deref(),
             others: &state.others,
+            agent_sort: state.agent_sort,
         };
         // Use cache key to skip rebuild when input hasn't changed
         let cache_key = mru::build_cache_key(
@@ -1223,6 +1236,7 @@ mod integration_tests {
             agent_id: agent_id.map(str::to_string),
             agent_status: models::AgentStatus::Idle,
             last_accessed_at: 0,
+            state_change_seq: 0,
         }
     }
 
