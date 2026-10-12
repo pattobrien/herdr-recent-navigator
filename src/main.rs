@@ -6,13 +6,14 @@ mod ipc;
 mod models;
 mod mru;
 mod others;
+mod theme;
 mod tracker;
 mod ui;
 
 #[cfg(test)]
 mod test_helpers;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, stdout};
 use std::path::PathBuf;
@@ -264,6 +265,10 @@ fn run_inner(cli: &Cli) -> RunInnerResult {
         state.theme_name = settings.theme();
     }
 
+    // Colour overrides live only in Herdr's config, so apply them regardless of
+    // which layer supplied the theme name.
+    state.theme_overrides = read_herdr_config_theme_overrides();
+
     if let Some(last) = AppState::load_last_category() {
         state.current_category = last;
     }
@@ -468,10 +473,52 @@ fn handle_track() -> Result<()> {
     Ok(())
 }
 
+/// Live herdr state used to filter stale MRU entries: which tab/pane ids
+/// currently exist and which are focused right now. Fetched in one IPC call.
+struct LiveFocusState {
+    tab_ids: HashSet<String>,
+    pane_ids: HashSet<String>,
+    focused_tab_id: Option<String>,
+    focused_pane_id: Option<String>,
+}
+
+fn fetch_live_focus_state() -> Option<LiveFocusState> {
+    let (nodes, focused_pane) = crate::ipc::fetch_all_nodes().ok()?;
+    Some(LiveFocusState {
+        tab_ids: nodes.iter().map(|n| n.tab_id.clone()).collect(),
+        pane_ids: nodes.iter().map(|n| n.pane_id.clone()).collect(),
+        focused_tab_id: focused_pane.as_ref().map(|p| p.tab_id.clone()),
+        focused_pane_id: focused_pane.map(|p| p.pane_id),
+    })
+}
+
+/// Pick the most recent MRU entry that still exists in the live herdr state
+/// and is not currently focused.
+///
+/// MRU history persists across herdr restarts while workspace ids are
+/// regenerated each session, so entries can dangle (e.g. `wC:t1` from an old
+/// session) and focusing them fails with `tab_not_found`/`agent_not_found`,
+/// which surfaces as the shortcut silently doing nothing (issue #17). When
+/// the live state is unavailable, falls back to the legacy behavior of
+/// taking the second entry (entries[0] is assumed to be the current one).
+fn pick_previous_entry<'a>(
+    entries: &[&'a tracker::MruEntry],
+    live_ids: Option<&HashSet<String>>,
+    focused_id: Option<&str>,
+) -> Option<&'a tracker::MruEntry> {
+    match live_ids {
+        Some(ids) => entries
+            .iter()
+            .copied()
+            .find(|e| focused_id != Some(e.id.as_str()) && ids.contains(&e.id)),
+        None => entries.get(1).copied(),
+    }
+}
+
 /// Focus the most recently focused tab (the "previous tab").
-/// Uses MRU history to find the second-most-recent tab entry (the first is
-/// the current tab). This lets users bind a shortcut to "jump to previous
-/// tab" without opening the navigator UI.
+/// Uses MRU history to find the most recent tab other than the current one.
+/// This lets users bind a shortcut to "jump to previous tab" without opening
+/// the navigator UI.
 fn handle_quick_focus_previous_tab() -> Result<()> {
     let entries = crate::tracker::load_mru();
     let tab_entries: Vec<_> = entries
@@ -479,8 +526,16 @@ fn handle_quick_focus_previous_tab() -> Result<()> {
         .filter(|e| e.kind == tracker::MruKind::Tab)
         .collect();
 
-    // tab_entries[0] is the current tab, [1] is the previous one
-    match tab_entries.get(1) {
+    let prev = match fetch_live_focus_state() {
+        Some(state) => pick_previous_entry(
+            &tab_entries,
+            Some(&state.tab_ids),
+            state.focused_tab_id.as_deref(),
+        ),
+        None => pick_previous_entry(&tab_entries, None, None),
+    };
+
+    match prev {
         Some(prev) => {
             log::info!("quick-focus-previous-tab: focusing tab {}", prev.id);
             crate::ipc::focus_tab(&prev.id)
@@ -493,9 +548,9 @@ fn handle_quick_focus_previous_tab() -> Result<()> {
 }
 
 /// Focus the most recently focused pane (the "previous pane").
-/// Uses MRU history to find the second-most-recent pane entry (the first is
-/// the current pane). This lets users bind a shortcut to "jump to previous
-/// pane" without opening the navigator UI.
+/// Uses MRU history to find the most recent pane other than the current one.
+/// This lets users bind a shortcut to "jump to previous pane" without opening
+/// the navigator UI.
 fn handle_quick_focus_previous_pane() -> Result<()> {
     let entries = crate::tracker::load_mru();
     log::debug!(
@@ -515,7 +570,16 @@ fn handle_quick_focus_previous_pane() -> Result<()> {
         log::debug!("  pane[{}]: id={}, ws={}", i, e.id, e.workspace_id);
     }
 
-    match pane_entries.get(1) {
+    let prev = match fetch_live_focus_state() {
+        Some(state) => pick_previous_entry(
+            &pane_entries,
+            Some(&state.pane_ids),
+            state.focused_pane_id.as_deref(),
+        ),
+        None => pick_previous_entry(&pane_entries, None, None),
+    };
+
+    match prev {
         Some(prev) => {
             log::info!("quick-focus-previous-pane: focusing pane {}", prev.id);
             crate::ipc::focus_pane(&prev.id)
@@ -905,6 +969,13 @@ fn herdr_config_path() -> Option<PathBuf> {
     )
 }
 
+/// Parse Herdr's own config file, if present and readable.
+fn read_herdr_config() -> Option<toml::Value> {
+    let path = herdr_config_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    content.parse().ok()
+}
+
 /// Read `[theme] name` from Herdr's own config file.
 ///
 /// This is the authoritative source for the user's active theme. Herdr does not
@@ -912,14 +983,24 @@ fn herdr_config_path() -> Option<PathBuf> {
 /// is unreachable for anyone who hasn't hand-edited the plugin manifest.
 /// Returns `None` if the config is missing, unreadable, or has no `[theme] name`.
 fn read_herdr_config_theme() -> Option<String> {
-    let path = herdr_config_path()?;
-    let content = std::fs::read_to_string(path).ok()?;
-    let value: toml::Value = content.parse().ok()?;
+    let value = read_herdr_config()?;
     let name = value.get("theme")?.get("name")?.as_str()?.trim();
     if name.is_empty() {
         return None;
     }
     Some(name.to_string())
+}
+
+/// Read `[theme.custom]` colour overrides from Herdr's own config file.
+///
+/// These layer on top of the theme palette the same way Herdr applies them on
+/// top of its built-in theme. A missing config or absent/empty section yields no
+/// overrides.
+fn read_herdr_config_theme_overrides() -> crate::theme::ThemeOverrides {
+    read_herdr_config()
+        .and_then(|v| v.get("theme").and_then(|t| t.get("custom")).cloned())
+        .map(|custom| crate::theme::ThemeOverrides::from_toml(&custom))
+        .unwrap_or_default()
 }
 
 /// User-editable plugin settings (`theme`, `[keybindings]`, `[navigator]`).
@@ -1031,6 +1112,26 @@ mod theme_resolution_tests {
             assert_eq!(
                 read_herdr_config_theme(),
                 Some("catppuccin-latte".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn reads_theme_custom_overrides_from_herdr_config() {
+        let cfg = "[theme]\nname = \"terminal\"\n\n[theme.custom]\naccent = \"#a6e3a1\"\npanel_bg = \"reset\"\n";
+        with_herdr_config(Some(cfg), || {
+            let o = read_herdr_config_theme_overrides();
+            assert_eq!(o.accent, Some(ratatui::style::Color::Rgb(0xa6, 0xe3, 0xa1)));
+            assert_eq!(o.surface_dim, Some(ratatui::style::Color::Reset));
+        });
+    }
+
+    #[test]
+    fn returns_empty_overrides_when_custom_absent() {
+        with_herdr_config(Some("[theme]\nname = \"catppuccin\"\n"), || {
+            assert_eq!(
+                read_herdr_config_theme_overrides(),
+                crate::theme::ThemeOverrides::default()
             );
         });
     }
@@ -1267,5 +1368,157 @@ mod integration_tests {
             previous_agent_pane_id(&entries, &nodes, Some("shell")),
             Some("agent-a".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod quick_focus_tests {
+    use super::*;
+    use crate::ipc::mock_io;
+    use crate::test_helpers::with_temp_dir;
+    use serial_test::serial;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn tab_entry(id: &str, at: u64) -> tracker::MruEntry {
+        tracker::MruEntry {
+            kind: tracker::MruKind::Tab,
+            id: id.to_string(),
+            workspace_id: "w1".to_string(),
+            focused_at: at,
+            name: None,
+            workspace_name: None,
+        }
+    }
+
+    fn id_set(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn entries_refs(entries: &[tracker::MruEntry]) -> Vec<&tracker::MruEntry> {
+        entries.iter().collect()
+    }
+
+    // ── pick_previous_entry ──
+
+    #[test]
+    fn picks_most_recent_alive_entry_skipping_stale() {
+        // "wC:t1" is a leftover from a previous herdr session and no longer
+        // exists; the picker must skip it (issue #17).
+        let entries = vec![
+            tab_entry("w1:t1", 100),
+            tab_entry("wC:t1", 90),
+            tab_entry("w1:t2", 80),
+        ];
+        let refs = entries_refs(&entries);
+        let live = id_set(&["w1:t1", "w1:t2", "w1:t3"]);
+
+        let picked =
+            pick_previous_entry(&refs, Some(&live), Some("w1:t1")).expect("should find a target");
+        assert_eq!(picked.id, "w1:t2");
+    }
+
+    #[test]
+    fn never_picks_the_focused_entry() {
+        let entries = vec![tab_entry("w1:t1", 100), tab_entry("w1:t2", 90)];
+        let refs = entries_refs(&entries);
+        let live = id_set(&["w1:t1", "w1:t2"]);
+
+        let picked =
+            pick_previous_entry(&refs, Some(&live), Some("w1:t2")).expect("should find a target");
+        assert_eq!(picked.id, "w1:t1");
+    }
+
+    #[test]
+    fn returns_none_when_every_candidate_is_stale() {
+        let entries = vec![tab_entry("w1:t1", 100), tab_entry("wC:t1", 90)];
+        let refs = entries_refs(&entries);
+        let live = id_set(&["w1:t1"]);
+
+        assert!(pick_previous_entry(&refs, Some(&live), Some("w1:t1")).is_none());
+    }
+
+    #[test]
+    fn falls_back_to_second_entry_without_live_state() {
+        // Legacy behavior: without live state, entries[0] is assumed to be
+        // the current entity and entries[1] is the target.
+        let entries = vec![tab_entry("w1:t1", 100), tab_entry("wC:t1", 90)];
+        let refs = entries_refs(&entries);
+
+        let picked = pick_previous_entry(&refs, None, None).expect("should find a target");
+        assert_eq!(picked.id, "wC:t1");
+    }
+
+    // ── end-to-end regression for issue #17 ──
+
+    /// Queues mocks for the three live-state IPC calls (workspace/tab/pane
+    /// list) followed by a failing focus call whose stderr names the target
+    /// id, so the test can assert *which* entry the handler selected.
+    fn mock_live_state_with_failing_focus(target: &str) {
+        let ws = mock_io::make_output(
+            r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"~"}]}}"#,
+        );
+        let tabs = mock_io::make_output(
+            r#"{"result":{"tabs":[{"tab_id":"w1:t1","workspace_id":"w1"},{"tab_id":"w1:t2","workspace_id":"w1"}]}}"#,
+        );
+        let panes = mock_io::make_output(
+            r#"{"result":{"panes":[{"pane_id":"w1:p1","workspace_id":"w1","tab_id":"w1:t1","focused":true},{"pane_id":"w1:p2","workspace_id":"w1","tab_id":"w1:t2","focused":false}]}}"#,
+        );
+        let agents = mock_io::make_output(r#"{"result":{"agents":[]}}"#);
+        let focus = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: b"{}".to_vec(),
+            stderr: format!("focused {target}").into_bytes(),
+        };
+        mock_io::set_mock_outputs(vec![ws, tabs, panes, agents, focus]);
+    }
+
+    #[test]
+    #[serial]
+    fn quick_focus_previous_tab_skips_stale_mru_entry() {
+        with_temp_dir(|dir| {
+            std::fs::write(
+                dir.join("mru.json"),
+                r#"[
+                    {"kind":"Tab","id":"w1:t1","workspace_id":"w1","focused_at":100},
+                    {"kind":"Tab","id":"wC:t1","workspace_id":"wC","focused_at":90},
+                    {"kind":"Tab","id":"w1:t2","workspace_id":"w1","focused_at":80}
+                ]"#,
+            )
+            .unwrap();
+            mock_live_state_with_failing_focus("w1:t2");
+
+            let err = handle_quick_focus_previous_tab()
+                .expect_err("focus mock is configured to fail")
+                .to_string();
+            assert!(
+                err.contains("w1:t2") && !err.contains("wC:t1"),
+                "should target the live previous tab, got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn quick_focus_previous_pane_skips_stale_mru_entry() {
+        with_temp_dir(|dir| {
+            std::fs::write(
+                dir.join("mru.json"),
+                r#"[
+                    {"kind":"Pane","id":"w1:p1","workspace_id":"w1","focused_at":100},
+                    {"kind":"Pane","id":"wC:p1","workspace_id":"wC","focused_at":90},
+                    {"kind":"Pane","id":"w1:p2","workspace_id":"w1","focused_at":80}
+                ]"#,
+            )
+            .unwrap();
+            mock_live_state_with_failing_focus("w1:p2");
+
+            let err = handle_quick_focus_previous_pane()
+                .expect_err("focus mock is configured to fail")
+                .to_string();
+            assert!(
+                err.contains("w1:p2") && !err.contains("wC:p1"),
+                "should target the live previous pane, got: {err}"
+            );
+        });
     }
 }
