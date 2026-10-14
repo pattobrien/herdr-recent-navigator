@@ -114,6 +114,7 @@ fn main() -> Result<()> {
 
     // ── Terminal setup ──
     // The pane runs as an overlay inside Herdr. Uses raw stdin/stdout directly.
+    let host = TerminalHost::detect();
     crossterm::terminal::enable_raw_mode()?;
     let mut terminal = {
         let backend = CrosstermBackend::new(stdout());
@@ -136,18 +137,7 @@ fn main() -> Result<()> {
     if let Err(e) = std::fs::remove_file(pane_lock_path()) {
         log::debug!("Failed to remove pane lock file: {e}");
     }
-    // Write a cleanup sequence directly so the pane overlay restores cleanly.
-    {
-        use std::io::Write;
-        let mut out = stdout();
-        if let Err(e) = write!(out, "\x1b[?25h\x1b[0m") {
-            log::warn!("Failed to write cleanup sequence: {e}");
-        }
-        if let Err(e) = out.flush() {
-            log::warn!("Failed to flush stdout: {e}");
-        }
-    }
-    disable_raw_mode()?;
+    host.release(terminal)?;
 
     // ── Post-exit: focus the selected entity (connected mode) ──
     if connected && let Some(target) = selected_target {
@@ -162,6 +152,31 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+enum TerminalHost {
+    /// Herdr keeps showing the pane until it reaps the process, so a restored
+    /// cursor would flash over the last frame.
+    HerdrPane,
+    Shell,
+}
+
+impl TerminalHost {
+    fn detect() -> Self {
+        if std::env::var_os("HERDR_PLUGIN_ENTRYPOINT_ID").is_some() {
+            TerminalHost::HerdrPane
+        } else {
+            TerminalHost::Shell
+        }
+    }
+
+    fn release(self, terminal: Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+        match self {
+            TerminalHost::HerdrPane => std::mem::forget(terminal),
+            TerminalHost::Shell => drop(terminal),
+        }
+        disable_raw_mode()
+    }
 }
 
 /// Non-TUI core logic: data fetching, state initialization, MRU recording.
